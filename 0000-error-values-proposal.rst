@@ -257,4 +257,4 @@ Implementation Plan
 -------------------
 
 Well-Typed LLP will implement this proposal with financial support from
-Richard Eisenberg.
+Richard Eisenberg, under NSF grant number 1704041.
