@@ -1,0 +1,300 @@
+Richer error documents
+======================
+
+.. proposal-number:: Leave blank. This will be filled in when the proposal is
+                     accepted.
+.. ticket-url:: Leave blank. This will eventually be filled with the
+                ticket URL which will track the progress of the
+                implementation of the feature.
+.. implemented:: Leave blank. This will be filled in with the first GHC version which
+                 implements the described feature.
+.. highlight:: haskell
+.. header:: This proposal is `discussed at this pull request <https://github.com/ghc-proposals/ghc-proposals/pull/0>`_.
+            **After creating the pull request, edit this file again, update the
+            number in the link, and delete this bold sentence.**
+.. sectnum::
+.. contents::
+
+Enrich GHC's document types (``Doc`` and ``SDoc``) with support for
+annotations of some arbitrary type ``a``, and use this new capability
+to emit error messages with bits of expressions, types and more
+embedded in the documents, as AST values, as opposed to their
+textual form which is not amenable to any form of inspection or
+post-processing.
+
+Motivation
+----------
+
+GHC's whole pretty printing infrastructure is based around the following
+types:::
+
+    data Doc
+      = Empty                                            -- empty
+      | NilAbove Doc                                     -- text "" $$ x
+      | TextBeside !TextDetails {-# UNPACK #-} !Int Doc  -- text s <> x
+      | Nest {-# UNPACK #-} !Int Doc                     -- nest k x
+      | Union Doc Doc                                    -- ul `union` ur
+      | NoDoc                                            -- The empty set of documents
+      | Beside Doc Bool Doc                              -- True <=> space between
+      | Above Doc Bool Doc                               -- True <=> never overlap
+
+    data SDocContext = SDC { ... }
+    newtype SDoc = SDoc { runSDoc :: SDocContext -> Doc }
+
+The exact contents of ``SDocContext`` is not very important, one just needs
+to know that it gives access to all sorts of pretty-printing and GHC
+related configuration. These two types allow us to specify how sub-documents
+should be placed relative to one another once rendered and have been great to
+describe all sorts of textual documents in GHC.
+
+On the other hand, authors of tools in the IDE/editor-integration space
+have been wondering about the possibility of enriching those error
+documents, with several applications in mind -- we will mention a few in
+the **Effects and Interactions** section. All of those applications require
+that we keep some information around, stored in good old ADTs, that we can
+freely inspect and consume: bits of expressions, types, constraints, etc.
+
+To bridge that gap, this proposal suggests that we add support for
+embedding annotations (non-textual values) directly into our documents,
+as described in the next section.
+
+Proposed Change Specification
+-----------------------------
+
+This proposal suggests that we modify ``Doc`` to extend it with a
+constructor for embedding arbitrary values into documents, which we refer
+to as "annotations".::
+
+    data Doc a
+      = Empty
+        -- empty
+      | ...
+      | Pure a -- new! embed an annotation of type 'a'
+
+Such a document model comes with useful instances for standard
+classes, among which ``Functor``, ``Aplicative``, ``Monad``, ``Foldable``
+and ``Traversable``, giving us standard names for functions that
+transform annotations into other annotations or into whole new sub-documents.
+
+``SDoc`` would similarly be updated to take a type parameter for the
+annotation type:::
+
+    newtype SDoc a = SDoc { runSDoc :: SDocContext -> Doc a }
+
+and would come with similar instances as ``Doc`` (since with this definition,
+``SDoc ~ ReaderT SDocContext Doc``), except for ``Foldable`` and
+``Traversable``. The main addition to the public API of the ``Outputable``
+module would be a function for constructing a document from an annotation:::
+
+    embed :: a -> SDoc a
+    embed = pure
+
+We could then create an annotation type for error documents, so as to
+embed bits of expressions, types and more, in their AST form, right into
+the documents, even supporting embedding ASTs from all 3 GHC passes.::
+
+    data PassWrapper f
+      = WrapperPs (f GhcPs) -- parser AST
+      | WrapperRn (f GhcRn) -- renamer AST
+      | WrapperTc (f GhcTc) -- typechecker AST
+
+    data ErrAnnotation
+      = ErrHsExpr (PassWrapper HsExpr)
+        -- ^ expression annotation, from any of the 3 phases
+      | ...
+
+We could then start emitting ``ErrAnnotation`` values in our documents
+instead of rendering expressions, types, and friends directly.
+GHC's error storage and reporting infrastructure could then be updated to
+emit ``SDoc ErrAnnotation`` values, with the nice side effect that GHC API users
+(such as developers of IDE tooling) would now get to deal with error documents
+with that type. Most users will quite likely then want to use ``>>=`` to process
+those annotations and render them using GHC's default rendition or a custom
+one:::
+
+    (>>=) :: SDoc a -> (a -> SDoc b) -> SDoc b
+
+The ``Monad`` is exactly what is required to substitute all annotations by some
+annotation-free document that depends on the annotation value. In our scenario,
+``b`` will be ``()`` or ``Void``, indicating the "annotation-free" nature.
+We could even imagine tweaking the functions that actually print documents to
+only accept annotation-free documents, so as to force users to interpret
+annotations one way or another before getting the documents printed somewhere.
+
+In fact, GHC uses ``SDoc`` in other contexts than error messages, a major
+one being code generation. In those cases, we will never want to emit
+any annotation, just pure text, and as fast as possible. This would be another
+case where we would want to deal with ``SDoc Void`` values. It is therefore
+desired that any potential implementation of this proposal doesn't drastically
+change the performance document construction and rendering when no annotation is
+involved.
+
+Pieces of code that don't produce annotations in documents can either
+produce documents that are completely polymorphic in the annotation type,
+or ``SDoc Void`` values. The polymorphic variant has the merit of being
+usable in code that produces documents with a specific annotation type. This
+would let us print snippets of expressions inside error messages
+(``SDoc ErrAnnotation``), or in the output generated by some ``-ddump-*`` flag
+(``SDoc Void``).
+
+However, with the changes described so far, we would run into a problem. While
+the semantics of the existing ``Doc`` constructors are pretty clear in terms of
+layout, there is no good answer when interpreting a ``Pure a``. We will never
+know for sure what text this annotation is going to end up being replaced with,
+since the point of this proposal exactly consists in sprinkling non-textual
+Haskell values all over our documents and rendering them later. This in turns
+means that we can't reliably "guess" whether our annotation is going to end up
+being rendered over several lines, nor how many columns or levels of nesting it
+will involve.
+
+To work around this problem, we suggest to adopt the trick used in the
+`wl-pprint-extras <https://hackage.haskell.org/package/wl-pprint-extras>`_
+library, which consists in introducing constructors that allow users to
+introduce (sub-)documents that are dependent on the exact column number,
+nesting level, ribbon length, etc. For instance, this is how we would define
+the constructor that "suspends" a sub-document on the column number of the
+current position in the textual rendering of a larger document:::
+
+    data Doc a
+      = ...
+      | Pure a
+      | Column (Int -> Doc a) -- new!
+      | ...
+
+While this now prevents ``Doc`` from being ``Foldable`` or ``Traversable``
+(which isn't that big of a deal since ``SDoc`` wasn't going to support those
+operations anyway and it is the type that we manipulate the most),
+it nicely solves the problem of having to "guess" properties about the
+textual rendition of an annotation, while mixing several pieces of documents
+to produce a larger one using specific semantics.
+
+Effect and Interactions
+-----------------------
+
+The main point of adding support for annotations as described
+above is to give a chance to tooling authors to easily access
+AST fragments that today are simply pretty-printed as part of
+some error messages, and this is indeed made possible by this
+proposal. GHC's main error message data type is ``ErrMsg``,
+which contains useful metadata and the actual error message
+document(s), of type ``ErrDoc``.::
+
+    type MsgDoc = SDoc
+
+    data ErrDoc = ErrDoc {
+            -- | Primary error msg.
+            errDocImportant     :: [MsgDoc],
+            -- | Context e.g. \"In the second argument of ...\".
+            errDocContext       :: [MsgDoc],
+            -- | Supplementary information, e.g. \"Relevant bindings include ...\".
+            errDocSupplementary :: [MsgDoc]
+            }
+
+Changing the definition of ``MsgDoc`` to
+``type MsgDoc = SDoc ErrAnnotation`` and fixing all the
+resulting issues will make it possible to build error
+messages that contain annotations. Since such an ``MsgDoc``
+*could* contain annotations but doesn't necessarily have to,
+we could start emitting annotations incrementally, completing
+this over several patches.
+
+Once the annotations are set up, GHC API consumers would
+be able to get their hands on them when a compilation
+returns non-empty bags of ``ErrMsg`` and ``WarnMsg`` values, and could
+decide to use them to apply the following ideas or others in the same spirit.
+
+* A REPL front-end or IDE tool might implement color-coded output,
+  choosing a token's color by its syntactic class (e.g. type constructor,
+  data constructor, or identifier), its name or some other criterion
+  entirely.
+
+* A REPL front-end or IDE tool might allow users the ability to
+  interactively navigate a type in a type error and, for instance,
+  allow the user to interactively expand type synonyms, show kind
+  signatures, etc.
+
+* A REPL front-end or IDE tool might allow users the ability to toggle a
+  setting in order to display expressions, types and other AST related
+  entities in their AST form instead of pretty-printed. This could be useful
+  for anyone working on plugins or GHC itself.
+
+Costs and Drawbacks
+-------------------
+
+The ``Outputable`` class in GHC lets us specify how to render values of all
+sorts of types as documents:::
+
+    class Outputable a where
+        ppr :: a -> SDoc
+
+One drawback of our approach is that we can't allow ``Outputable`` instances
+to emit annotations without either using the same annotation type everywhere
+(and changing ``ppr`` to return a document with such annotations), or
+introducing a type family or functional dependency to map each ``a`` to a
+corresponding annotation type. That still would not be good enough, as some
+values end up being used in error messages (``ErrAnnotation``) as well as
+in GHC-generated dumps (``Void`` annotations) -- e.g expressions, types.
+
+What we will instead have to do is change ``ppr`` to have the following type:::
+
+    class Outputable a where
+        ppr :: a -> SDoc b
+
+By being polymorphic in the annotation type, we can at least recover the
+ability to pretty-print the same values in documents that use different
+annotation types. We will however have to arrange for the annotations to
+be produced outside of those ``Outputable`` instances.
+
+A good chunk of the work required for implementing this proposal will most
+likely consist in adapting a lot of code in GHC that takes or returns
+``SDoc`` values, and decide whether the annotation type should be
+``Void``, ``ErrAnnotation`` or left polymorphic. Any implementation of this
+proposal should also make sure that the current rendering of error messages
+and IR dumps is not affected, in particular by the tricky pretty-printing
+techniques that are going to be required to perform accurate layout
+computations in the presence of annotations.
+
+Alternatives
+------------
+
+The design for annotated documents as described in this proposal is based
+on the approach used by the *wl-pprint-extras* library, and lets us stick
+annotations at the leaves of our "document tree", and is sometimes referred
+to as the "*pointed* annotations" approach. An alternative design, used for
+example in the Idris compiler, conists in introducing *scoped* annotations:::
+
+    data Doc a
+      = ...
+      | Ann a (Doc a)
+
+where the annotation wraps a sub-document, attaching non-textual information
+to it. This approach has a few drawbacks in our case:
+
+* We want to delay rendering, and the two most obvious ways to use this design
+  would be to attach an annotation to either an empty document to emulate
+  our pointed annotations approach, or to a textual version of the annotation.
+  We are not guaranteed that this text is the one that's going to be used
+  further down the road when reporting errors, since one of the applications of
+  this proposal is to allow tooling authors to customize how some error
+  message entities are rendered.
+
+* This variant of ``Doc`` does not seem to come with lawful ``Applicative``
+  and ``Monad`` instances, which provide a familiar and rich toolbox for
+  introducing, transforming and eliminating annotations.
+
+Unresolved Questions
+--------------------
+
+The only aspect of the implementation that is not crystal clear at this point
+is the handling of annotation nodes in a few key functions from
+``compiler/utils/Pretty.hs``. Fortunately, any implementation that does not
+preserve the current layout bit for bit will quite likely be caught by the
+testsuite. We are quite confident that this can be figured out with careful
+thinking, and by using the literature and the implementation of the
+*wl-pprint-extras* library as inspirations.
+
+Implementation Plan
+-------------------
+
+Well-Typed LLP will implement this proposal with financial support from
+Richard Eisenberg, under NSF grant number 1704041.
