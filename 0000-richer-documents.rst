@@ -22,6 +22,9 @@ embedded in the documents, as AST values, as opposed to their
 textual form which is not amenable to any form of inspection or
 post-processing.
 
+This proposal drew a lot of inspiration from the discussion at
+`ghc#8809 <https://gitlab.haskell.org/ghc/ghc/issues/8809>`_.
+
 Motivation
 ----------
 
@@ -82,8 +85,8 @@ annotation type:::
     newtype SDoc a = SDoc { runSDoc :: SDocContext -> Doc a }
 
 and would come with similar instances as ``Doc`` (since with this definition,
-``SDoc ~ ReaderT SDocContext Doc``), except for ``Foldable`` and
-``Traversable``. The main addition to the public API of the ``Outputable``
+``SDoc`` is isomorphic to ``ReaderT SDocContext Doc``), except for ``Foldable``
+and ``Traversable``. The main addition to the public API of the ``Outputable``
 module would be a function for constructing a document from an annotation:::
 
     embed :: a -> SDoc a
@@ -114,12 +117,13 @@ one:::
 
     (>>=) :: SDoc a -> (a -> SDoc b) -> SDoc b
 
-The ``Monad`` is exactly what is required to substitute all annotations by some
-annotation-free document that depends on the annotation value. In our scenario,
-``b`` will be ``()`` or ``Void``, indicating the "annotation-free" nature.
-We could even imagine tweaking the functions that actually print documents to
-only accept annotation-free documents, so as to force users to interpret
-annotations one way or another before getting the documents printed somewhere.
+This ``Monad`` instance lets us substitute all the annotations in a document
+by fresh, new subdocuments that can depend on the annotation values. Of
+particular interest is the case where ``b`` is ``()`` or ``Void``, indicating
+the "annotation-free" nature of the resulting document.  We could even imagine
+tweaking the functions that actually print documents to only accept
+annotation-free documents, so as to force users to interpret annotations one
+way or another before getting the documents printed somewhere.
 
 In fact, GHC uses ``SDoc`` in other contexts than error messages, a major
 one being code generation. In those cases, we will never want to emit
