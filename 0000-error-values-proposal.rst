@@ -26,7 +26,7 @@ Up until this day, the errors that GHC emits are represented as mere
 textual documents. They often involve fancy layout constructs but GHC's
 code never manipulates errors, warnings or suggestions as values of some
 algebraic data types that are later rendered in the user's terminal; errors
-only exist as documents.
+only ever exist as documents.
 
 This means that developers of IDE-style tooling (e.g
 `Haskell IDE Engine <https://github.com/haskell/haskell-ide-engine>`_) have
@@ -46,6 +46,7 @@ error printing infrastructure.
 
 **Note**: the textual rendering of the errrors, warnings and suggestions
 should remain identical, this proposal really is about GHC's
+"internal" (it is exposed to GHC API users, so not entirely internal)
 representation of errors.
 
 Proposed Change Specification
@@ -121,25 +122,27 @@ uniformly errors from different systems:::
 
 One can then define helper functions such as
 ``notInScope :: OccName -> Name -> GHCError`` to be able to easily construct
-error values from within, say, the guts of a typechecker function, without
+error values from within, say, the guts of a renamer function, without
 having to make the intermediate layers and wrapping visible there. We would
 create, manipulate and store ``GHCError`` values until the very last moment,
 when it is time to render the errors and report them. This would require
-implementing ``errorMessage :: GHCError -> ErrMsg``, and would be equivalent
-to all the ``ErrMsg`` building code that GHC has right now.
+implementing ``errorMessage :: GHCError -> ErrDoc``, and would be equivalent
+to all the ``ErrDoc`` building code that GHC has right now.
 
 Error consumers (the GHC program, GHC API users) would be presented with
 ``GHCError`` values, and would be free to just call ``errorMessage`` on them
 to generate error message documents, or do something more interesting with
-some or all errors, using good old pattern matching to provide a specific
-interpretation for the errors of interest.
+some or all of the error values, using good old pattern matching to provide a
+specific interpretation for the errors of interest.
 
 For error producers, the main change is that the different subsystems will
 define error types and helper functions to build error values. In order for
 ``GHCError`` to be able to refer to all the different error types, and for
 those types to use names from the module where ``GHCError`` is defined, we will
-have to introduce a few ``.hs-boot`` files to work around the import cycles
-induced by such an architecture.
+quite likely have to introduce ``.hs-boot`` files to work around
+the import cycles induced by such an architecture. The exact details should be
+figured out at implementation time, but there might be a way to get away with
+just one ``.hs-boot`` file (must be confirmed).
 
 It is important to note that ``errorMessage`` ties this proposal back with
 the existing system. Right now, GHC immediately emits error messages
@@ -164,7 +167,7 @@ given earlier as follows:::
       = UnnecessaryImport ModuleName
       | ...
 
-    warningMessage :: GHCWarning -> ErrMsg
+    warningMessage :: GHCWarning -> ErrDoc
 
     type ErrorMessages   = Bag GHCError
     type WarningMessages = Bag GHCWarning
@@ -174,7 +177,7 @@ given earlier as follows:::
 augment ``GHCError`` with a constructor dedicated to warnings.)
 
 Finally, we would have to update some error reporting infrastructure
-to take ``GHCError`` values as arguments instead of ``ErrMsg``. That is
+to take ``GHCError`` values as arguments instead of ``ErrDoc``. That is
 the point at which the actual rendering of error messages would happen,
 under this proposal, right before calling the code that logs the said errors.
 
@@ -217,12 +220,18 @@ be made a lot easier if the current proposal is accepted.
   query GHC for the analysis result asynchronously (or even only when
   requested by the user), shrinking the edit/typechecking iteration time.
 
+* If GHC ever wants to assign error codes to all the possible errors that it can
+  produce (e.g to give an in-depth explanation of all errors and possible
+  solutions in some error reference document), we could very easily derive or
+  manually implement sensible schemes quite trivially from the error data types.
+
 Costs and drawbacks
 -------------------
 
-The import cycles induced by this architecture and the ``.hs-boot`` files that
-we will use to work around them are going to add some maintenance overhead
-which we believe is largely compensated by having errors become proper values.
+The potential import cycles induced by this architecture and the ``.hs-boot``
+file(s) that we might add to work around them are going to add a little bit of
+maintenance overhead which we believe is largely compensated by having errors
+become proper values.
 
 Another drawback is that the wrapping in ``ParserError``, ``GHCError`` and
 friends can be a bit verbose, becoming more verbose still as we introduce
@@ -248,7 +257,7 @@ existential wrapper around an open union of error types that provide
 suitable instances:::
 
     class HasErrMsg e where
-      errorMessage :: e -> ErrMsg
+      errorMessage :: e -> ErrDoc
 
     data GHCError where
       GHCError :: (Typeable e, HasErrMsg e) => e -> GHCError
@@ -259,8 +268,8 @@ have to use ``Typeable`` to implement specific behaviours for some types of
 errors. This price is likely a higher one to pay in the long run than the
 import cycles that we would work around when implementing the current proposal,
 as the cost will likely be non-trivial when/if we implement the proposal, but
-rather small afterwards, especially with a flat hierarchy. GHC does not get a
-new subsystem all that often.
+very small afterwards, especially with a flat hierarchy. GHC does not get a
+new subsystem nor an error infrastructure redesign all that often.
 
 Unresolved Questions
 --------------------
